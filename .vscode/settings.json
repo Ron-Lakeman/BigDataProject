@@ -1,0 +1,12 @@
+{
+    "duckdb.databases": [
+        {
+            "alias": "ProjectData",
+            "type": "file",
+            "path": "/home/ronlakeman/MasterInformationStudies/BigDataCourse/big-data-course-2024-projects/BigDataProject/ProjectData.duckdb",
+            "attached": true,
+            "readOnly": false
+        }
+    ],
+    "duckdb.defaultDatabase": "ProjectData"
+}

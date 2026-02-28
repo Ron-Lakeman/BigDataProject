@@ -12,7 +12,7 @@ con.execute("""
 
 # Create tables (or views) INSIDE those specific schemas
 con.execute("""
-    CREATE TABLE IF NOT EXISTS bronze.raw_data (id INTEGER);
+    CREATE TABLE IF NOT EXISTS bronze.reviews_raw (id INTEGER);
     CREATE TABLE IF NOT EXISTS silver.cleaned_data (id INTEGER);
     CREATE TABLE IF NOT EXISTS gold.ml_features (id INTEGER);
 """)

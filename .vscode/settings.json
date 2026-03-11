@@ -9,6 +9,7 @@
         }
     ],
     "duckdb.defaultDatabase": "ProjectData",
+    "python.defaultInterpreterPath": "${workspaceFolder}\\venv_bigdata\\Scripts\\python.exe",
     "python-envs.defaultEnvManager": "ms-python.python:venv",
     "python-envs.defaultPackageManager": "ms-python.python:pip"
 }

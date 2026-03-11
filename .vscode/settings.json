@@ -8,5 +8,7 @@
             "readOnly": false
         }
     ],
-    "duckdb.defaultDatabase": "ProjectData"
+    "duckdb.defaultDatabase": "ProjectData",
+    "python-envs.defaultEnvManager": "ms-python.python:venv",
+    "python-envs.defaultPackageManager": "ms-python.python:pip"
 }

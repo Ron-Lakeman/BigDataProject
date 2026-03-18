@@ -20,8 +20,10 @@ from pyspark.sql.functions import current_timestamp, input_file_name, monotonica
 from pyspark.sql.types import StructType, StructField, StringType
 from delta.tables import DeltaTable
 import duckdb as db
+from prefect import task, flow
 
 
+@task(name="Configure Spark Environment")
 def configure_environment():
     """Set up Spark and Delta Lake environment variables."""
     os.environ['SPARK_LOCAL_IP'] = '127.0.0.1'
@@ -53,6 +55,7 @@ def configure_environment():
     print('HADOOP_HOME:', os.environ.get('HADOOP_HOME', '<not set>'))
 
 
+@task(name="Create Spark Session", persist_result=False)
 def create_spark_session():
     """Create a SparkSession with Delta Lake extensions enabled."""
     return SparkSession.builder \
@@ -64,6 +67,7 @@ def create_spark_session():
         .getOrCreate()
 
 
+@task(name="Get Transaction Schemas")
 def get_transaction_schemas():
     """Define the expected schemas for incoming CSV files."""
     transaction_schema_training = StructType([
@@ -100,6 +104,7 @@ def get_transaction_schemas():
     return transaction_schema_training, transaction_schema_test_val
 
 
+@task(name="Load CSV Data to PySpark DataFrame", persist_result=False)
 def load_csv_data(spark, raw_csv_dir, schema, path_glob_filter):
     """Load CSV data with metadata columns."""
     return (spark.read
@@ -116,6 +121,7 @@ def load_csv_data(spark, raw_csv_dir, schema, path_glob_filter):
     )
 
 
+@task(name="Merge/Upload Delta Table")
 def merge_or_create_table(spark, df, path, dataset_name):
     """Perform MERGE or initial write for a dataset."""
     if DeltaTable.isDeltaTable(spark, path):
@@ -133,6 +139,7 @@ def merge_or_create_table(spark, df, path, dataset_name):
         df.write.format("delta").mode("overwrite").save(path)
 
 
+@task(name="Load Delta to DuckDB")
 def load_to_duckdb(project_root, bronze_train_path, bronze_test_path, bronze_validation_path):
     """Load Delta tables into DuckDB."""
     with db.connect(os.path.join(project_root, "ProjectData.duckdb")) as con:
@@ -169,6 +176,7 @@ def load_to_duckdb(project_root, bronze_train_path, bronze_test_path, bronze_val
         print(f"Corrupt rows validation data in db: {validation_corrupt}")
 
 
+@flow(name="Ingest to Bronze Flow", log_prints=True)
 def run_ingestion():
     """Main ingestion pipeline."""
     print("=" * 60)

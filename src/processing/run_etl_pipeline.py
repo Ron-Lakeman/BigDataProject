@@ -4,11 +4,13 @@ ETL Pipeline Orchestrator
 This script orchestrates the execution of the ETL pipeline:
 1. Bronze Layer: Ingest raw CSV data into Delta tables
 2. Silver Layer: Clean and transform data from Bronze to Silver
+3. Gold Layer: Build features from Silver dataset
 
 Usage:
     python run_etl_pipeline.py          # Run full pipeline
     python run_etl_pipeline.py bronze   # Run only bronze ingestion
     python run_etl_pipeline.py silver   # Run only silver transformation
+    python run_etl_pipeline.py gold     # Run only gold transformation
 """
 
 import sys
@@ -29,16 +31,22 @@ def run_silver_transformation():
     silver_transform()
 
 
+def run_gold_transformation():
+    """Run the Gold layer transformation step."""
+    from all_features_to_gold import run_gold_transformation as gold_transform
+    gold_transform()
+
+
 def run_pipeline(steps=None):
     """
     Execute the ETL pipeline.
     
     Args:
-        steps: List of steps to run. Options: ['bronze', 'silver'].
+        steps: List of steps to run. Options: ['bronze', 'silver', 'gold'].
                If None, runs all steps in order.
     """
     if steps is None:
-        steps = ['bronze', 'silver']
+        steps = ['bronze', 'silver', 'gold']
     
     pipeline_start = time.time()
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -63,7 +71,7 @@ def run_pipeline(steps=None):
             step_times['bronze'] = time.time() - step_start
             
             print(f"\n[OK] Bronze ingestion completed in {step_times['bronze']:.2f} seconds")
-        
+            
         if 'silver' in steps:
             print("\n" + "#" * 70)
             print("# STEP 2: SILVER LAYER TRANSFORMATION")
@@ -74,7 +82,18 @@ def run_pipeline(steps=None):
             step_times['silver'] = time.time() - step_start
             
             print(f"\n[OK] Silver transformation completed in {step_times['silver']:.2f} seconds")
-    
+
+        if 'gold' in steps:
+            print("\n" + "#" * 70)
+            print("# STEP 3: GOLD LAYER TRANSFORMATION")
+            print("#" * 70 + "\n")
+            
+            step_start = time.time()
+            run_gold_transformation()
+            step_times['gold'] = time.time() - step_start
+            
+            print(f"\n[OK] Gold transformation completed in {step_times['gold']:.2f} seconds")
+            
     except Exception as e:
         failed_step = steps[len(step_times)]
         print(f"\n[ERROR] Pipeline failed at step: {failed_step}")
@@ -103,7 +122,7 @@ def run_pipeline(steps=None):
 
 def main():
     """Main entry point with CLI argument handling."""
-    valid_steps = {'bronze', 'silver', 'all'}
+    valid_steps = {'bronze', 'silver', 'gold', 'all'}
     
     if len(sys.argv) > 1:
         requested = sys.argv[1].lower()

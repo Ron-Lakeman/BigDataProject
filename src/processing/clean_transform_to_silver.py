@@ -21,6 +21,7 @@ from collections import Counter
 
 import duckdb
 import pandas as pd
+from prefect import task, flow
 
 
 # Ordered list of expected fields when reconstructing a malformed raw record.
@@ -47,6 +48,7 @@ valid_marketplace_ids = set()
 valid_category_ids = set()
 
 
+@task(name="Setup Paths")
 def setup_paths():
     """Set up all required paths."""
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -71,6 +73,7 @@ def setup_paths():
     return project_root, raw_dir, bronze_dir, silver_dir, bronze_split_paths, silver_split_dirs
 
 
+@task(name="Load Reference Data")
 def load_reference_data(raw_dir):
     """Load reference data for domain validation."""
     global valid_marketplace_ids, valid_category_ids
@@ -293,6 +296,7 @@ def load_bronze_split(split_name, bronze_split_paths):
         return con.execute(query).df()
 
 
+@task(name="Process Bronze Splits")
 def process_splits(bronze_split_paths):
     """Process all Bronze splits and build clean candidate datasets."""
     split_results = {}
@@ -390,6 +394,7 @@ def process_splits(bronze_split_paths):
     return split_results, issue_counter, total_raw_rows
 
 
+@task(name="Deduplicate and Finalize")
 def deduplicate_and_finalize(split_results, issue_counter):
     """Deduplicate and finalize Silver-ready datasets."""
     silver_splits = {}
@@ -436,6 +441,7 @@ def deduplicate_and_finalize(split_results, issue_counter):
     return silver_splits, duplicates_removed_by_split
 
 
+@task(name="Print Data Quality Summary")
 def print_data_quality_summary(silver_splits, split_results, issue_counter, total_raw_rows, duplicates_removed_by_split):
     """Print data quality findings."""
     silver_df = pd.concat([silver_splits[s] for s in silver_splits], ignore_index=True)
@@ -467,6 +473,7 @@ def print_data_quality_summary(silver_splits, split_results, issue_counter, tota
         print(f"  {issue}: {count} ({pct}%)")
 
 
+@task(name="Export to Parquet")
 def export_to_parquet(silver_splits, silver_split_dirs, silver_dir):
     """Export cleaned outputs by split to Parquet."""
     silver_dir.mkdir(parents=True, exist_ok=True)
@@ -482,6 +489,7 @@ def export_to_parquet(silver_splits, silver_split_dirs, silver_dir):
         print(f"  {split_name:<10} -> {clean_parquet}")
 
 
+@flow(name="Silver Layer Transformation Pipeline")
 def run_silver_transformation():
     """Main silver transformation pipeline."""
     print("=" * 60)

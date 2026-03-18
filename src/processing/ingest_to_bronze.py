@@ -121,8 +121,29 @@ def load_csv_data(spark, raw_csv_dir, schema, path_glob_filter):
         .withColumn("_index", monotonically_increasing_id())
     )
 
+@task(name="Validate Data Counts", persist_result=False)
+def validate_counts(dataset_name, old_count, new_count, final_count):
+    """Verifies that the new CSV count matches the final Delta row count."""
+    logger = get_run_logger()
+    logger.info(f"[{dataset_name}] Old: {old_count} | New CSV: {new_count} | Final: {final_count}")
 
-@task(name="Merge/Upload Delta Table")
+    if final_count != new_count:
+        msg = f"[{dataset_name}] STRICT VALIDATION FAILED: New CSV length ({new_count}) does NOT equal Final Delta length ({final_count})"
+        logger.error(msg)
+        raise ValueError(msg)
+    else:
+        logger.info(f"[{dataset_name}] Strict Validation Passed: CSV data length perfectly matches Delta Table length")
+
+
+@task(name="Get Existing Delta Table Count", persist_result=False)
+def get_existing_table_count(spark, path):
+    """Returns the row count of an existing Delta table or 0"""
+    if DeltaTable.isDeltaTable(spark, path):
+        return spark.read.format("delta").load(path).count()
+    return 0
+
+
+@task(name="Merge/Upload Delta Table", persist_result=False)
 def merge_or_create_table(spark, df, path, dataset_name):
     """Perform MERGE or initial write for a dataset."""
     if DeltaTable.isDeltaTable(spark, path):
@@ -139,45 +160,39 @@ def merge_or_create_table(spark, df, path, dataset_name):
         df.write.format("delta").mode("overwrite").save(path)
 
 
-# @task(name="Load Delta to DuckDB")
-# def load_to_duckdb(project_root, bronze_train_path, bronze_test_path, bronze_validation_path):
-#     """Load Delta tables into DuckDB."""
-#     with db.connect(os.path.join(project_root, "ProjectData.duckdb")) as con:
-#         con.execute("CREATE SCHEMA IF NOT EXISTS bronze;")
+@task(name="Load Delta to DuckDB")
+def load_to_duckdb(project_root, bronze_train_path, bronze_test_path, bronze_validation_path):
+    """Load Delta tables into DuckDB."""
+    with db.connect(os.path.join(project_root, "ProjectData.duckdb")) as con:
+        con.execute("CREATE SCHEMA IF NOT EXISTS bronze;")
 
-#         # Training data
-#         con.execute(f"""
-#             CREATE OR REPLACE TABLE bronze.reviews_train AS 
-#             SELECT * FROM delta_scan('{bronze_train_path}')
-#         """)
-#         train_count = con.execute("SELECT COUNT(*) FROM bronze.reviews_train").fetchone()[0]
-#         train_corrupt = con.execute("SELECT COUNT(*) FROM bronze.reviews_train WHERE _corrupt_record IS NOT NULL").fetchone()[0]
-#         print(f"Total rows training in db: {train_count}")
-#         print(f"Corrupt rows training in db: {train_corrupt}")
+        # Training data
+        con.execute(f"""
+            CREATE OR REPLACE TABLE bronze.reviews_train AS 
+            SELECT * FROM delta_scan('{bronze_train_path}')
+        """)
+        # train_count = con.execute("SELECT COUNT(*) FROM bronze.reviews_train").fetchone()[0]
+        train_corrupt = con.execute("SELECT COUNT(*) FROM bronze.reviews_train WHERE _corrupt_record IS NOT NULL").fetchone()[0]
 
-#         # Test data
-#         con.execute(f"""
-#             CREATE OR REPLACE TABLE bronze.reviews_test AS 
-#             SELECT * FROM delta_scan('{bronze_test_path}')
-#         """)
-#         test_count = con.execute("SELECT COUNT(*) FROM bronze.reviews_test").fetchone()[0]
-#         test_corrupt = con.execute("SELECT COUNT(*) FROM bronze.reviews_test WHERE _corrupt_record IS NOT NULL").fetchone()[0]
-#         print(f"\nTotal rows test data in db: {test_count}")
-#         print(f"Corrupt rows test data in db: {test_corrupt}")
+        # Test data
+        con.execute(f"""
+            CREATE OR REPLACE TABLE bronze.reviews_test AS 
+            SELECT * FROM delta_scan('{bronze_test_path}')
+        """)
+        # test_count = con.execute("SELECT COUNT(*) FROM bronze.reviews_test").fetchone()[0]
+        test_corrupt = con.execute("SELECT COUNT(*) FROM bronze.reviews_test WHERE _corrupt_record IS NOT NULL").fetchone()[0]
 
-#         # Validation data
-#         con.execute(f"""
-#             CREATE OR REPLACE TABLE bronze.reviews_validation AS 
-#             SELECT * FROM delta_scan('{bronze_validation_path}')
-#         """)
-#         validation_count = con.execute("SELECT COUNT(*) FROM bronze.reviews_validation").fetchone()[0]
-#         validation_corrupt = con.execute("SELECT COUNT(*) FROM bronze.reviews_validation WHERE _corrupt_record IS NOT NULL").fetchone()[0]
-#         print(f"\nTotal rows validation data in db: {validation_count}")
-#         print(f"Corrupt rows validation data in db: {validation_corrupt}")
-
+        # Validation data
+        con.execute(f"""
+            CREATE OR REPLACE TABLE bronze.reviews_validation AS 
+            SELECT * FROM delta_scan('{bronze_validation_path}')
+        """)
+        # validation_count = con.execute("SELECT COUNT(*) FROM bronze.reviews_validation").fetchone()[0]
+        validation_corrupt = con.execute("SELECT COUNT(*) FROM bronze.reviews_validation WHERE _corrupt_record IS NOT NULL").fetchone()[0]
+        return train_corrupt, test_corrupt, validation_corrupt
 
 @flow(name="Ingest to Bronze Flow", log_prints=True)
-def run_ingestion():
+def run_ingestion_bronze():
     """Main ingestion pipeline."""
     logger = get_run_logger()
     logger.info("Starting Bronze layer ingestion pipeline")
@@ -210,28 +225,25 @@ def run_ingestion():
                 logger.info(f"Removing invalid Delta path (missing _delta_log): {path}")
                 shutil.rmtree(path)
 
+        # Capture old counts BEFORE ingestion
+        old_train_count = get_existing_table_count(spark, bronze_train_path)
+        old_test_count = get_existing_table_count(spark, bronze_test_path)
+        old_valid_count = get_existing_table_count(spark, bronze_validation_path)
+
         # training and test data is loaded from the source
         base_df = load_csv_data(spark, raw_csv_dir, transaction_schema_training, "train-*.csv")
         training_count = base_df.count()
+        logger.info(f"Training data loaded with {training_count} rows")
+
+        # load test data from source
         test_df = load_csv_data(spark, raw_csv_dir, transaction_schema_test_val, "test_hidden.csv")
         test_df_count = test_df.count()
-        # Load validation data
+        logger.info(f"Test data loaded with {test_df_count} rows")
+
+        # load validation data
         validation_df = load_csv_data(spark, raw_csv_dir, transaction_schema_test_val, "validation_hidden.csv")
         validation_count = validation_df.count()
-
-        create_markdown_artifact(
-            key="ingestion-counts",
-            markdown=f"""# Data Loaded from Source
-            Data Loaded from CSV's into PySpark DataFrames with the following row counts:
-
-            | Dataset | Row Count |
-            | :--- | :--- |
-            | Training | {training_count} |
-            | Test | {test_df_count} |
-            | Validation | {validation_count} |
-            """,
-            description="Row counts for initial ingested datasets"
-        )
+        logger.info(f"Validation data loaded with {validation_count} rows")
 
         # Merge into Delta tables
         merge_or_create_table(spark, base_df, bronze_train_path, "Training")
@@ -243,21 +255,45 @@ def run_ingestion():
         test_table_df = spark.read.format("delta").load(bronze_test_path)
         validation_table_df = spark.read.format("delta").load(bronze_validation_path)
 
-        print(f"Total rows training data: {train_table_df.count()}")
-        print(f"Total rows test data: {test_table_df.count()}")
-        print(f"Total rows validation data: {validation_table_df.count()}")
+        final_train_count = train_table_df.count()
+        final_test_count = test_table_df.count()
+        final_valid_count = validation_table_df.count()
 
-        # # Load into DuckDB
-        # print("\n--- Loading into DuckDB ---")
-        # load_to_duckdb(project_root, bronze_train_path, bronze_test_path, bronze_validation_path)
+        logger.info(f"Total rows training data (post-merge): {final_train_count}")
+        logger.info(f"Total rows test data (post-merge): {final_test_count}")
+        logger.info(f"Total rows validation data (post-merge): {final_valid_count}")
 
-        # print("\n" + "=" * 60)
-        # print("BRONZE LAYER INGESTION COMPLETE")
-        # print("=" * 60)
+        # Perform Data Count Validations
+        validate_counts("Training", old_train_count, training_count, final_train_count)
+        validate_counts("Test", old_test_count, test_df_count, final_test_count)
+        validate_counts("Validation", old_valid_count, validation_count, final_valid_count)
+
+        # Load into DuckDB
+        train_corrupt, test_corrupt, validation_corrupt = load_to_duckdb(project_root, bronze_train_path, bronze_test_path, bronze_validation_path)
+        
+        create_markdown_artifact(
+            key="ingestion-counts",
+            markdown=f"""# Data Ingestion Summary
+We tracked the dataset row counts across all stages of the ingestion process:
+
+| Dataset | 1. Old (Pre-run) | 2. New (CSVs) | 3. Final (Delta) | 4. Corrupt Rows |
+| :--- | :--- | :--- | :--- | :--- |
+| **Training** | {old_train_count} | {training_count} | {final_train_count} | {train_corrupt} |
+| **Test** | {old_test_count} | {test_df_count} | {final_test_count} | {test_corrupt} |
+| **Validation**| {old_valid_count} | {validation_count} | {final_valid_count} | {validation_corrupt} |
+
+*(Note: Data counts may fluctuate during merges as duplicate rows are updated.)*
+""",
+            description="Comprehensive row counts comparing pre-run, CSV, final Delta logic, and corrupt records."
+        )
+        
+        
+        
+        print("BRONZE LAYER INGESTION COMPLETE")
 
     finally:
         spark.stop()
 
 
 if __name__ == "__main__":
-    run_ingestion()
+    run_ingestion_bronze()

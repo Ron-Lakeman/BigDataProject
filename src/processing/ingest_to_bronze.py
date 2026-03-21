@@ -289,7 +289,7 @@ We tracked the dataset row counts across all stages of the ingestion process:
         
         
         
-        print("BRONZE LAYER INGESTION COMPLETE")
+        print("BRONZE LAYER INGESTION DONE")
 
     finally:
         spark.stop()

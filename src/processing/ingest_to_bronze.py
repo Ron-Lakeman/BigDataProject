@@ -20,10 +20,15 @@ from pyspark.sql.functions import current_timestamp, input_file_name, monotonica
 from pyspark.sql.types import StructType, StructField, StringType
 from delta.tables import DeltaTable
 import duckdb as db
+from prefect import task, flow
+from prefect import task, get_run_logger
+from prefect.artifacts import create_markdown_artifact
 
 
+@task(name="Configure Spark Environment")
 def configure_environment():
-    """Set up Spark and Delta Lake environment variables."""
+
+    # set up Spark and Delta Lake environment variables
     os.environ['SPARK_LOCAL_IP'] = '127.0.0.1'
     os.environ['PYSPARK_SUBMIT_ARGS'] = '--packages io.delta:delta-spark_2.12:3.2.0 pyspark-shell'
 
@@ -47,12 +52,11 @@ def configure_environment():
             hadoop_bin = os.path.join(hadoop_home, 'bin')
             if hadoop_bin not in os.environ.get('PATH', ''):
                 os.environ['PATH'] = hadoop_bin + os.pathsep + os.environ.get('PATH', '')
-
-    print('OS:', os.name)
-    print('JAVA_HOME:', os.environ.get('JAVA_HOME', '<not set>'))
-    print('HADOOP_HOME:', os.environ.get('HADOOP_HOME', '<not set>'))
+    
+    
 
 
+@task(name="Create Spark Session", persist_result=False)
 def create_spark_session():
     """Create a SparkSession with Delta Lake extensions enabled."""
     return SparkSession.builder \
@@ -62,8 +66,10 @@ def create_spark_session():
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
         .config("spark.sql.legacy.csv.headerCheck.enabled", "false") \
         .getOrCreate()
+    
 
 
+@task(name="Get Transaction Schemas")
 def get_transaction_schemas():
     """Define the expected schemas for incoming CSV files."""
     transaction_schema_training = StructType([
@@ -96,10 +102,10 @@ def get_transaction_schemas():
         StructField("product_category_id", StringType(), True),
         StructField("_corrupt_record", StringType(), True)
     ])
-
     return transaction_schema_training, transaction_schema_test_val
+    
 
-
+@task(name="Load CSV Data to PySpark DataFrame", persist_result=False)
 def load_csv_data(spark, raw_csv_dir, schema, path_glob_filter):
     """Load CSV data with metadata columns."""
     return (spark.read
@@ -115,11 +121,32 @@ def load_csv_data(spark, raw_csv_dir, schema, path_glob_filter):
         .withColumn("_index", monotonically_increasing_id())
     )
 
+@task(name="Validate Data Counts", persist_result=False)
+def validate_counts(dataset_name, old_count, new_count, final_count):
+    """Verifies that the new CSV count matches the final Delta row count."""
+    logger = get_run_logger()
+    logger.info(f"[{dataset_name}] Old: {old_count} | New CSV: {new_count} | Final: {final_count}")
 
+    if final_count != new_count:
+        msg = f"[{dataset_name}] STRICT VALIDATION FAILED: New CSV length ({new_count}) does NOT equal Final Delta length ({final_count})"
+        logger.error(msg)
+        raise ValueError(msg)
+    else:
+        logger.info(f"[{dataset_name}] Strict Validation Passed: CSV data length perfectly matches Delta Table length")
+
+
+@task(name="Get Existing Delta Table Count", persist_result=False)
+def get_existing_table_count(spark, path):
+    """Returns the row count of an existing Delta table or 0"""
+    if DeltaTable.isDeltaTable(spark, path):
+        return spark.read.format("delta").load(path).count()
+    return 0
+
+
+@task(name="Merge/Upload Delta Table", persist_result=False)
 def merge_or_create_table(spark, df, path, dataset_name):
     """Perform MERGE or initial write for a dataset."""
     if DeltaTable.isDeltaTable(spark, path):
-        print(f"{dataset_name}: Existing Delta table found. Merging new data...")
         target_table = DeltaTable.forPath(spark, path)
         target_table.alias("target").merge(
             df.alias("source"),
@@ -129,10 +156,11 @@ def merge_or_create_table(spark, df, path, dataset_name):
         .whenNotMatchedInsertAll() \
         .execute()
     else:
-        print(f"{dataset_name}: No existing Delta table found. Creating new table...")
+        # if no existing Delta table found. Creating new table
         df.write.format("delta").mode("overwrite").save(path)
 
 
+@task(name="Load Delta to DuckDB")
 def load_to_duckdb(project_root, bronze_train_path, bronze_test_path, bronze_validation_path):
     """Load Delta tables into DuckDB."""
     with db.connect(os.path.join(project_root, "ProjectData.duckdb")) as con:
@@ -143,112 +171,129 @@ def load_to_duckdb(project_root, bronze_train_path, bronze_test_path, bronze_val
             CREATE OR REPLACE TABLE bronze.reviews_train AS 
             SELECT * FROM delta_scan('{bronze_train_path}')
         """)
-        train_count = con.execute("SELECT COUNT(*) FROM bronze.reviews_train").fetchone()[0]
+        # train_count = con.execute("SELECT COUNT(*) FROM bronze.reviews_train").fetchone()[0]
         train_corrupt = con.execute("SELECT COUNT(*) FROM bronze.reviews_train WHERE _corrupt_record IS NOT NULL").fetchone()[0]
-        print(f"Total rows training in db: {train_count}")
-        print(f"Corrupt rows training in db: {train_corrupt}")
 
         # Test data
         con.execute(f"""
             CREATE OR REPLACE TABLE bronze.reviews_test AS 
             SELECT * FROM delta_scan('{bronze_test_path}')
         """)
-        test_count = con.execute("SELECT COUNT(*) FROM bronze.reviews_test").fetchone()[0]
+        # test_count = con.execute("SELECT COUNT(*) FROM bronze.reviews_test").fetchone()[0]
         test_corrupt = con.execute("SELECT COUNT(*) FROM bronze.reviews_test WHERE _corrupt_record IS NOT NULL").fetchone()[0]
-        print(f"\nTotal rows test data in db: {test_count}")
-        print(f"Corrupt rows test data in db: {test_corrupt}")
 
         # Validation data
         con.execute(f"""
             CREATE OR REPLACE TABLE bronze.reviews_validation AS 
             SELECT * FROM delta_scan('{bronze_validation_path}')
         """)
-        validation_count = con.execute("SELECT COUNT(*) FROM bronze.reviews_validation").fetchone()[0]
+        # validation_count = con.execute("SELECT COUNT(*) FROM bronze.reviews_validation").fetchone()[0]
         validation_corrupt = con.execute("SELECT COUNT(*) FROM bronze.reviews_validation WHERE _corrupt_record IS NOT NULL").fetchone()[0]
-        print(f"\nTotal rows validation data in db: {validation_count}")
-        print(f"Corrupt rows validation data in db: {validation_corrupt}")
+        return train_corrupt, test_corrupt, validation_corrupt
 
-
-def run_ingestion():
+@flow(name="Ingest to Bronze Flow", log_prints=True)
+def run_ingestion_bronze():
     """Main ingestion pipeline."""
-    print("=" * 60)
-    print("BRONZE LAYER INGESTION")
-    print("=" * 60)
+    logger = get_run_logger()
+    logger.info("Starting Bronze layer ingestion pipeline")
 
     # Configure environment
     configure_environment()
+    logger.info("Spark environment configuration has finished.")
 
     # Initialize Spark
     spark = create_spark_session()
+    logger.info("Spark session created")
 
     try:
         # Get schemas
         transaction_schema_training, transaction_schema_test_val = get_transaction_schemas()
+        logger.info("Retrieved transaction schemas")
+
 
         # Set up paths
         current_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.abspath(os.path.join(current_dir, "../../"))
-
         raw_csv_dir = os.path.join(project_root, "reviews (copy)")
         bronze_train_path = os.path.join(project_root, "data", "bronze", "train")
         bronze_test_path = os.path.join(project_root, "data", "bronze", "test")
         bronze_validation_path = os.path.join(project_root, "data", "bronze", "validation")
 
-        print(f"\nReading from: {raw_csv_dir}")
-        print(f"Writing train to:      {bronze_train_path}")
-        print(f"Writing test to:       {bronze_test_path}")
-        print(f"Writing validation to: {bronze_validation_path}")
-
-        # Clean up old non-Delta data if needed
+        # clean up old non-Delta data if needed
         for path in [bronze_train_path, bronze_test_path, bronze_validation_path]:
             if os.path.exists(path) and not os.path.exists(os.path.join(path, "_delta_log")):
+                logger.info(f"Removing invalid Delta path (missing _delta_log): {path}")
                 shutil.rmtree(path)
 
-        # Load training data
-        print("\n--- Loading Training Data ---")
+        # Capture old counts BEFORE ingestion
+        old_train_count = get_existing_table_count(spark, bronze_train_path)
+        old_test_count = get_existing_table_count(spark, bronze_test_path)
+        old_valid_count = get_existing_table_count(spark, bronze_validation_path)
+
+        # training and test data is loaded from the source
         base_df = load_csv_data(spark, raw_csv_dir, transaction_schema_training, "train-*.csv")
-        train_count = base_df.count()
-        print(f"Training data loaded: {train_count} rows")
+        training_count = base_df.count()
+        logger.info(f"Training data loaded with {training_count} rows")
 
-        # Load test data
-        print("\n--- Loading Test Data ---")
+        # load test data from source
         test_df = load_csv_data(spark, raw_csv_dir, transaction_schema_test_val, "test_hidden.csv")
-        test_count = test_df.count()
-        print(f"Test data loaded: {test_count} rows")
+        test_df_count = test_df.count()
+        logger.info(f"Test data loaded with {test_df_count} rows")
 
-        # Load validation data
-        print("\n--- Loading Validation Data ---")
+        # load validation data
         validation_df = load_csv_data(spark, raw_csv_dir, transaction_schema_test_val, "validation_hidden.csv")
         validation_count = validation_df.count()
-        print(f"Validation data loaded: {validation_count} rows")
+        logger.info(f"Validation data loaded with {validation_count} rows")
 
         # Merge into Delta tables
-        print("\n--- Writing to Delta Tables ---")
         merge_or_create_table(spark, base_df, bronze_train_path, "Training")
         merge_or_create_table(spark, test_df, bronze_test_path, "Test")
         merge_or_create_table(spark, validation_df, bronze_validation_path, "Validation")
 
         # Validate Delta tables
-        print("\n--- Validating Delta Tables ---")
         train_table_df = spark.read.format("delta").load(bronze_train_path)
         test_table_df = spark.read.format("delta").load(bronze_test_path)
         validation_table_df = spark.read.format("delta").load(bronze_validation_path)
 
-        print(f"Total rows training data: {train_table_df.count()}")
-        print(f"Total rows test data: {test_table_df.count()}")
-        print(f"Total rows validation data: {validation_table_df.count()}")
+        final_train_count = train_table_df.count()
+        final_test_count = test_table_df.count()
+        final_valid_count = validation_table_df.count()
+
+        logger.info(f"Total rows training data (post-merge): {final_train_count}")
+        logger.info(f"Total rows test data (post-merge): {final_test_count}")
+        logger.info(f"Total rows validation data (post-merge): {final_valid_count}")
+
+        # Perform Data Count Validations
+        validate_counts("Training", old_train_count, training_count, final_train_count)
+        validate_counts("Test", old_test_count, test_df_count, final_test_count)
+        validate_counts("Validation", old_valid_count, validation_count, final_valid_count)
 
         # Load into DuckDB
-        print("\n--- Loading into DuckDB ---")
-        load_to_duckdb(project_root, bronze_train_path, bronze_test_path, bronze_validation_path)
+        train_corrupt, test_corrupt, validation_corrupt = load_to_duckdb(project_root, bronze_train_path, bronze_test_path, bronze_validation_path)
+        
+        create_markdown_artifact(
+            key="ingestion-counts",
+            markdown=f"""# Data Ingestion Summary
+We tracked the dataset row counts across all stages of the ingestion process:
 
-        print("\n" + "=" * 60)
-        print("BRONZE LAYER INGESTION COMPLETE")
-        print("=" * 60)
+| Dataset | 1. Old (Pre-run) | 2. New (CSVs) | 3. Final (Delta) | 4. Corrupt Rows |
+| :--- | :--- | :--- | :--- | :--- |
+| **Training** | {old_train_count} | {training_count} | {final_train_count} | {train_corrupt} |
+| **Test** | {old_test_count} | {test_df_count} | {final_test_count} | {test_corrupt} |
+| **Validation**| {old_valid_count} | {validation_count} | {final_valid_count} | {validation_corrupt} |
+
+*(Note: Data counts may fluctuate during merges as duplicate rows are updated.)*
+""",
+            description="Comprehensive row counts comparing pre-run, CSV, final Delta logic, and corrupt records."
+        )
+        
+        
+        
+        print("BRONZE LAYER INGESTION DONE")
 
     finally:
         spark.stop()
 
 
 if __name__ == "__main__":
-    run_ingestion()
+    run_ingestion_bronze()

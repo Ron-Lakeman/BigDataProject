@@ -8,3 +8,8 @@ langdetect
 sentence-transformers
 transformers
 textstat
+scikit-learn
+xgboost
+matplotlib
+seaborn
+prefect
